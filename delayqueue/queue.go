@@ -27,6 +27,8 @@ type IntegerType interface {
 	int | int8 | int16 | int32 | int64 | uint | uint8 | uint16 | uint32 | uint64 | time.Duration
 }
 
+type CallbackFunc func([]byte)
+
 // DelayQueue implements a delayed queue. Elements added to it will be removed again after a specified duration, calling a callback in the process.
 type DelayQueue struct {
 	ring  index.IndexField
@@ -34,7 +36,8 @@ type DelayQueue struct {
 	free  *freelist.Freelist
 
 	delay  time.Duration
-	submit func([]byte)
+	submit CallbackFunc
+	dump   CallbackFunc
 
 	c     chan interface{}
 	close chan chan struct{}
@@ -111,8 +114,8 @@ func NewReadable(file string) (*DelayQueue, error) {
 
 // NewWritable creates a new delay queue. <delay> is the duration between adding and removing an element.
 // <elements> is the number of elements the queue can contain at modest. <file> is the path to the file used for persistence/memory extension.
-// <submitFunc> is the function that is called with the element that is removed.
-func NewWriteable(delay time.Duration, elements int, file string, submitFunc func([]byte)) (*DelayQueue, error) {
+// <submitFunc> is the function that is called with the element that is removed. <dumpFunc> is the function to be called when a dump is requested.
+func NewWriteable(delay time.Duration, elements int, file string, submitFunc, dumpFunc CallbackFunc) (*DelayQueue, error) {
 	q, err := newQueue(delay, elements, file)
 	if err != nil {
 		return nil, err
@@ -120,13 +123,14 @@ func NewWriteable(delay time.Duration, elements int, file string, submitFunc fun
 	q.c = make(chan interface{}, 100)
 	q.close = make(chan chan struct{}, 2)
 	q.submit = submitFunc
+	q.dump = dumpFunc
 	go q.loop()
 	return q, nil
 }
 
 // Init is a helper function to set up a delay queue.
-func Init(storageDir string, delayInSeconds int, callbackFunc func([]byte)) (*DelayQueue, error) {
-	return NewWriteable(time.Duration(delayInSeconds)*time.Second, DefaultElements, path.Join(storageDir, StorageFile), callbackFunc)
+func Init(storageDir string, delayInSeconds int, submitFunc, dumpFunc func([]byte)) (*DelayQueue, error) {
+	return NewWriteable(time.Duration(delayInSeconds)*time.Second, DefaultElements, path.Join(storageDir, StorageFile), submitFunc, dumpFunc)
 }
 
 // AddMsg adds a message to the delay queue.
@@ -190,6 +194,7 @@ func (queue *DelayQueue) loop() {
 	var nextTrigger index.UnixTimestamp
 	var lastPos uint64
 	var dumpStart, dumpEnd uint64
+	var doDump bool
 	timer = time.NewTimer(time.Hour * 1000)
 	for {
 		change := false
@@ -205,20 +210,25 @@ func (queue *DelayQueue) loop() {
 				}
 				change = true
 			case int:
-				if d == dumpCmd && dumpStart == dumpEnd {
+				if d == dumpCmd && !doDump {
 					start, found := queue.ring.First(0)
 					if found {
 						dumpStart, dumpEnd = start, queue.ring.MaxCounter()
 					}
+					doDump = true
 				}
 			default:
 			}
 		case <-timer.C:
 			lastPos, change = queue.sendDelayed(lastPos)
 		default:
-			if dumpStart != dumpEnd {
-				queue.submit(queue.slots.Read(queue.ring.At(dumpStart).BeginByte()))
+			if doDump {
+				queue.dump(queue.slots.Read(queue.ring.At(dumpStart).BeginByte()))
 				dumpStart++
+				if dumpStart > dumpEnd {
+					doDump = false
+					dumpStart, dumpEnd = 0, 0
+				}
 			}
 		}
 		if change {
