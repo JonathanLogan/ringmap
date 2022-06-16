@@ -106,6 +106,9 @@ func (batcher *Batcher) flush() {
 		go func() { <-batcher.t.C }()
 		batcher.t.Reset(batcher.maxAge)
 	}
+	if len(batcher.currentBatch.data) == 0 {
+		return
+	}
 	oldBatch := batcher.currentBatch
 	batcher.currentBatch = NewBatch(batcher.maxSize)
 	a := new(bytes.Buffer)
@@ -118,4 +121,14 @@ func (batcher *Batcher) Flush() {
 	batcher.m.Lock()
 	defer batcher.m.Unlock()
 	batcher.flush()
+}
+
+// Close the batch processing and flush current content..
+func (batcher *Batcher) Close() {
+	if !batcher.t.Stop() {
+		go func() { <-batcher.t.C }()
+	}
+	a := new(bytes.Buffer)
+	batcher.currentBatch.Flush(a)
+	batcher.r(a.Bytes())
 }
