@@ -20,6 +20,9 @@ func TestDelayQueue(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		msg := []byte(fmt.Sprintf("Message: %d", i))
 		fmt.Printf("Queue: %s\n", string(msg))
+		if i == 30 {
+			queue.Dump()
+		}
 		queue.AddMsg(msg)
 		time.Sleep(time.Millisecond * 100)
 	}

@@ -19,6 +19,8 @@ const (
 	StorageFile     = "delayStorage.db"
 	slotMargin      = 1
 	minFireDuration = time.Millisecond * 100
+
+	dumpCmd = 1
 )
 
 type IntegerType interface {
@@ -34,7 +36,7 @@ type DelayQueue struct {
 	delay  time.Duration
 	submit func([]byte)
 
-	c     chan []byte
+	c     chan interface{}
 	close chan chan struct{}
 
 	mapFile *os.File
@@ -115,7 +117,7 @@ func NewWriteable(delay time.Duration, elements int, file string, submitFunc fun
 	if err != nil {
 		return nil, err
 	}
-	q.c = make(chan []byte, 10)
+	q.c = make(chan interface{}, 100)
 	q.close = make(chan chan struct{}, 2)
 	q.submit = submitFunc
 	go q.loop()
@@ -135,6 +137,11 @@ func (queue *DelayQueue) AddMsg(d []byte) {
 	queue.c <- d
 }
 
+// Dump all messages from the queue to the callback.
+func (queue *DelayQueue) Dump() {
+	queue.c <- int(dumpCmd)
+}
+
 // Export the contents of a queue.
 func (queue *DelayQueue) Export(callback func(time.Time, []byte)) {
 	for i, _ := queue.ring.First(0); i <= queue.ring.MaxCounter(); i++ {
@@ -150,47 +157,80 @@ func max[T IntegerType](a, b T) T {
 	return b
 }
 
+func (queue *DelayQueue) receive(d []byte) bool {
+	pos := queue.slots.Write(d, queue.free.Draw)
+	if pos == gapstore.EndOfSlots {
+		return false
+	}
+	if oldPos, _, replaced := queue.ring.Append(pos); replaced {
+		queue.submit(queue.slots.ReadOnce(oldPos, queue.free.Return))
+	}
+	return true
+}
+
+func (queue *DelayQueue) sendDelayed(lastPos uint64) (uint64, bool) {
+	change := false
+MessageLoop:
+	for {
+		nextPos, found := queue.ring.First(lastPos)
+		if found && queue.ring.At(nextPos).UnixTime().Time().Add(queue.delay).Before(time.Now()) {
+			change = true
+			queue.submit(queue.slots.ReadOnce(queue.ring.At(nextPos).BeginByte(), queue.free.Return))
+			queue.ring.Wipe(nextPos)
+			lastPos = nextPos
+		} else {
+			break MessageLoop
+		}
+	}
+	return lastPos, change
+}
+
 func (queue *DelayQueue) loop() {
 	var timer *time.Timer
 	var nextTrigger index.UnixTimestamp
 	var lastPos uint64
+	var dumpStart, dumpEnd uint64
 	timer = time.NewTimer(time.Hour * 1000)
-
 	for {
+		change := false
 		select {
 		case q := <-queue.close:
 			q <- struct{}{}
 			return
-		case d := <-queue.c:
-			pos := queue.slots.Write(d, queue.free.Draw)
-			if pos == gapstore.EndOfSlots {
-				continue
-			}
-			if oldPos, _, replaced := queue.ring.Append(pos); replaced {
-				queue.submit(queue.slots.ReadOnce(oldPos, queue.free.Return))
-			}
-
-		case <-timer.C:
-		MessageLoop:
-			for {
-				nextPos, found := queue.ring.First(lastPos)
-				if found && queue.ring.At(nextPos).UnixTime().Time().Add(queue.delay).Before(time.Now()) {
-					queue.submit(queue.slots.ReadOnce(queue.ring.At(nextPos).BeginByte(), queue.free.Return))
-					queue.ring.Wipe(nextPos)
-					lastPos = nextPos
-				} else {
-					break MessageLoop
+		case inf := <-queue.c:
+			switch d := inf.(type) {
+			case []byte:
+				if !queue.receive(d) {
+					continue
 				}
+				change = true
+			case int:
+				if d == dumpCmd && dumpStart == dumpEnd {
+					start, found := queue.ring.First(0)
+					if found {
+						dumpStart, dumpEnd = start, queue.ring.MaxCounter()
+					}
+				}
+			default:
+			}
+		case <-timer.C:
+			lastPos, change = queue.sendDelayed(lastPos)
+		default:
+			if dumpStart != dumpEnd {
+				queue.submit(queue.slots.Read(queue.ring.At(dumpStart).BeginByte()))
+				dumpStart++
 			}
 		}
-		timePos, found := queue.ring.First(lastPos)
-		if found {
-			newTime := queue.ring.At(timePos).UnixTime()
-			nextFire := max(newTime.Time().Add(queue.delay).Sub(time.Now()), minFireDuration)
-			if newTime != nextTrigger {
-				timer.Stop()
-				timer.Reset(nextFire)
-				nextTrigger = newTime
+		if change {
+			timePos, found := queue.ring.First(lastPos)
+			if found {
+				newTime := queue.ring.At(timePos).UnixTime()
+				nextFire := max(newTime.Time().Add(queue.delay).Sub(time.Now()), minFireDuration)
+				if newTime != nextTrigger {
+					timer.Stop()
+					timer.Reset(nextFire)
+					nextTrigger = newTime
+				}
 			}
 		}
 	}
